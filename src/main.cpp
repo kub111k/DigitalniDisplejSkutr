@@ -6,7 +6,8 @@
 
 // --- NASTAVENÍ PINŮ ---
 #define ONE_WIRE_BUS 21 // Teplota
-#define RPM_PIN 25      // Otáčkoměr z optočlenu
+#define RPM_PIN 25      // Otáčkoměr
+#define PALIVO_PIN 33   // Plovák nádrže
 
 OneWire oneWire(ONE_WIRE_BUS);
 DallasTemperature senzory(&oneWire);
@@ -23,81 +24,131 @@ unsigned long posledniPrekresleni = 0;
 unsigned long posledniMereniTeploty = 0; 
 float aktualniTeplota = 0.0;             
 
-// --- PROMĚNNÉ PRO OTÁČKOMĚR (Volatile znamená, že se mění z přerušení) ---
+// --- PROMĚNNÉ PRO OTÁČKOMĚR ---
 volatile unsigned long casPoslednihoImpulsu = 0;
 volatile unsigned long delkaImpulsuMicros = 0;
 int aktualniRPM = 0;
 
-// --- FUNKCE PŘERUŠENÍ (Volá se sama při každé jiskře) ---
+// --- PROMĚNNÉ PRO PALIVOMĚR ---
+int rawPlna = 130;    
+int rawPrazdna = 845;  
+int procentaPaliva = 0;
+float vyhlazenyRawPalivo = -1.0; // Paměť pro extrémní softwarovou filtraci
+
+// --- PAMĚŤ PRO PLYNULÉ VYKRESLOVÁNÍ (PROTI BLIKÁNÍ) ---
+int staraSirkaRPM = -1;
+uint16_t staraBarvaRPM = 0;
+int staraSirkaFuel = -1;
+uint16_t staraBarvaFuel = 0;
+
+// --- FUNKCE PŘERUŠENÍ (RPM) ---
 void IRAM_ATTR zmerOtacky() {
   unsigned long aktualniCas = micros();
   unsigned long rozdil = aktualniCas - casPoslednihoImpulsu;
-  
-  // Zvýšený Debounce filtr: 5000 mikrosekund = max 12 000 ot/min.
-  // Pokud přijde další impuls dříve než za 5 ms, zahodíme ho jako rušení (dozvuk jiskry).
   if (rozdil > 5000) { 
     delkaImpulsuMicros = rozdil;
     casPoslednihoImpulsu = aktualniCas;
   }
 }
 
+// --- VYKRESLENÍ STATICKÉ GRAFIKY PRO 480x320 ---
+void nakresliRozhrani() {
+  tft.fillScreen(TFT_BLACK);
+
+  // Horní dělicí čára pro stavovou lištu
+  tft.drawLine(0, 40, 480, 40, TFT_DARKGREY);
+  
+  // Spodní dělicí čára pod rychlostí (prostřední panel)
+  tft.drawLine(0, 220, 480, 220, TFT_DARKGREY);
+
+  // Rámečky pro bargrafy (Vyplňovat se budou uvnitř)
+  tft.drawRect(10, 255, 460, 15, TFT_DARKGREY);
+  tft.drawRect(10, 300, 460, 15, TFT_DARKGREY);
+
+  // Statické nápisy uprostřed
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(TFT_SKYBLUE, TFT_BLACK);
+  tft.drawString("km/h", 240, 190, 4);
+
+  // Statické nápisy vlevo
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+  tft.drawString("TRIP (km)", 10, 60, 2);
+  tft.drawString("RPM", 10, 235, 2);
+  tft.drawString("FUEL", 10, 280, 2);
+
+  // Statické nápisy vpravo
+  tft.setTextDatum(TR_DATUM);
+  tft.drawString("TEMP", 470, 60, 2);
+}
+
 void setup() {
   Serial.begin(115200);
   SerialGPS.begin(9600, SERIAL_8N1, 16, 17);
 
-  // --- START SENZORŮ ---
   senzory.begin();
   senzory.setWaitForConversion(false); 
   senzory.requestTemperatures();       
 
-  // --- START OTÁČKOMĚRU ---
-  pinMode(RPM_PIN, INPUT_PULLUP); // Použijeme vnitřní odpor ESP32
-  // Nastavíme přerušení na pin D25, bude reagovat na pád napětí (FALLING), když optočlen sepne
+  pinMode(RPM_PIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(RPM_PIN), zmerOtacky, FALLING);
 
-  // --- START DISPLEJE ---
   tft.init();
-  tft.setRotation(0); 
+  tft.setRotation(1); // ZMĚNA ORIENTACE NA ŠÍŘKU
+  tft.invertDisplay(true); // Ochrana proti bílému pozadí
+  
   tft.fillScreen(TFT_BLACK);
 
+  // Uvítací obrazovka
   tft.setTextColor(TFT_YELLOW, TFT_BLACK);
   tft.setTextDatum(MC_DATUM);
-  tft.drawString("KEEWAY SYSTEM", 120, 120, 4);
+  tft.drawString("KEEWAY SYSTEM", 240, 160, 4);
   delay(2000);
-  tft.fillScreen(TFT_BLACK);
+  
+  // Vykreslení statické "kostry" rozhraní
+  nakresliRozhrani();
 }
 
 void loop() {
-  // GPS ČTENÍ (Běží pořád)
   while (SerialGPS.available() > 0) {
     gps.encode(SerialGPS.read());
   }
 
-  // MĚŘENÍ TEPLOTY (1x za vteřinu)
+  // --- MĚŘENÍ TEPLOTY (1x za sekundu) ---
   if (millis() - posledniMereniTeploty > 1000) {
     posledniMereniTeploty = millis();
     aktualniTeplota = senzory.getTempCByIndex(0); 
     senzory.requestTemperatures();                
   }
 
-  // PŘEKRESLENÍ DISPLEJE (5x za vteřinu)
+  // --- PŘEKRESLENÍ DISPLEJE (5x za sekundu) ---
   if (millis() - posledniPrekresleni > 200) {
     posledniPrekresleni = millis();
 
-    // --- VÝPOČET OTÁČEK (RPM) ---
-    // Pokud jsme víc jak 0.5 vteřiny nedostali jiskru, motor stojí.
+    // --- VÝPOČET OTÁČEK ---
     if (micros() - casPoslednihoImpulsu > 500000) {
       aktualniRPM = 0;
     } else if (delkaImpulsuMicros > 0) {
-      // Skútr je 2-takt = 1 jiskra za otáčku.
-      // 60 milionů mikrosekund (1 minuta) / délka jednoho pulsu = otáčky za minutu
       int vypocitaneRPM = 60000000 / delkaImpulsuMicros; 
-      
-      // Mírné vyhlazení skoků (Bere 80 % staré hodnoty a 20 % nové)
       aktualniRPM = (aktualniRPM * 0.8) + (vypocitaneRPM * 0.2);
     }
 
-    // Výpočet Tripu
+    // --- VÝPOČET PALIVA S EXTRÉMNÍ FILTRACÍ (EMA) ---
+    int aktualniRaw = analogRead(PALIVO_PIN);
+    
+    // Rychlý náběh při prvním spuštění
+    if (vyhlazenyRawPalivo < 0) {
+      vyhlazenyRawPalivo = aktualniRaw;
+    } else {
+      // Magie filtru: 98 % staré hodnoty + 2 % z nového měření
+      vyhlazenyRawPalivo = (vyhlazenyRawPalivo * 0.98) + (aktualniRaw * 0.02);
+    }
+    
+    // Převod na procenta z vyhlazené hodnoty
+    procentaPaliva = map((int)vyhlazenyRawPalivo, rawPrazdna, rawPlna, 0, 100);
+    procentaPaliva = constrain(procentaPaliva, 0, 100);
+
+    // --- VÝPOČET TRIPU ---
     if (gps.location.isUpdated() && gps.location.isValid()) {
       if (posledniLat != 0.0 && posledniLng != 0.0) {
         double vzdalenostMetry = TinyGPSPlus::distanceBetween(
@@ -110,64 +161,110 @@ void loop() {
       posledniLng = gps.location.lng();
     }
 
-    // --- KRESLENÍ NA DISPLEJ ---
+    // ==========================================
+    // --- KRESLENÍ DYNAMICKÝCH DAT NA DISPLEJ ---
+    // ==========================================
 
     // 1. Hlava (Satelity a Čas)
+    tft.setTextPadding(80); 
+    tft.setTextDatum(TL_DATUM);
     tft.setTextColor(TFT_GREEN, TFT_BLACK);
-    tft.setTextSize(1);
     tft.setCursor(10, 10);
-    tft.print("SATS: "); 
-    tft.print(gps.satellites.value());
-    tft.print("  "); 
+    tft.printf("SATS: %d", gps.satellites.value());
 
     if (gps.time.isValid()) {
-      tft.setCursor(160, 10);
-      int hodina = gps.time.hour() + 2; // Letní čas
+      tft.setTextDatum(TR_DATUM);
+      tft.setTextColor(TFT_WHITE, TFT_BLACK);
+      int hodina = gps.time.hour() + 2; 
       if (hodina >= 24) hodina -= 24;
-      tft.printf("%02d:%02d", hodina, gps.time.minute());
+      char casString[10];
+      sprintf(casString, "%02d:%02d", hodina, gps.time.minute());
+      tft.drawString(casString, 470, 10, 4);
     }
 
-    // 2. Střed (RYCHLOST)
+    // 2. STŘEDOVÝ PANEL (RYCHLOST + TRIP + TEPLOTA)
     tft.setTextDatum(MC_DATUM);
     tft.setTextColor(TFT_WHITE, TFT_BLACK);
-    tft.setTextPadding(120);
-    tft.drawFloat(gps.speed.kmph(), 1, 120, 90, 7); // Posunuto mírně nahoru kvůli RPM
-    tft.setTextPadding(0);
-    tft.setTextColor(TFT_SKYBLUE, TFT_BLACK);
-    tft.drawString("km/h", 120, 150, 4);
+    tft.setTextPadding(150); 
+    tft.drawFloat(gps.speed.kmph(), 0, 240, 130, 7); 
 
-    // 3. BARGRAF PRO OTÁČKY (Pruh)
-    tft.setCursor(10, 180);
+    tft.setTextDatum(TL_DATUM);
     tft.setTextColor(TFT_WHITE, TFT_BLACK);
-    tft.printf("RPM: %04d", aktualniRPM);
+    tft.setTextPadding(100);
+    tft.drawFloat(tripVzdalenostKm, 1, 10, 95, 4);
 
-    // Vykreslení samotného proužku otáček (max 10 000 ot/min)
-    int sirkaPruhu = map(aktualniRPM, 0, 10000, 0, 220); // Zmapuje RPM na šířku displeje
-    if (sirkaPruhu > 220) sirkaPruhu = 220; // Ochrana proti přetečení
-    if (sirkaPruhu < 0) sirkaPruhu = 0;
-    
-    tft.drawRect(10, 195, 220, 12, TFT_DARKGREY); // Rámeček
-    
-    // Barva podle otáček (zelená/žlutá/červená)
-    uint16_t barvaPruhu = TFT_GREEN;
-    if (aktualniRPM > 7000) barvaPruhu = TFT_YELLOW;
-    if (aktualniRPM > 8500) barvaPruhu = TFT_RED;
-    
-    tft.fillRect(10, 195, sirkaPruhu, 12, barvaPruhu); // Vyplněný pruh
-    tft.fillRect(10 + sirkaPruhu, 195, 220 - sirkaPruhu, 12, TFT_BLACK); // Smazání zbytku pruhu
-
-    // 4. Spodek (Vzdálenost a Teplota)
-    tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
-    tft.setCursor(10, 220);
-    tft.print("TR: ");
-    tft.print(tripVzdalenostKm, 1); 
-
-    tft.setCursor(160, 220); 
+    tft.setTextDatum(TR_DATUM);
+    tft.setTextColor(TFT_ORANGE, TFT_BLACK);
+    tft.setTextPadding(100);
     if (aktualniTeplota <= -100.0) {
-      tft.print("ERR   "); 
+      tft.drawString("ERR", 470, 95, 4); 
     } else {
-      tft.print(aktualniTeplota, 1); 
-      tft.print("C  ");             
+      char teplotaStr[10];
+      sprintf(teplotaStr, "%.0fC", aktualniTeplota);
+      tft.drawString(teplotaStr, 470, 95, 4);
     }
+
+    // 3. BARGRAF PRO OTÁČKY
+    tft.setTextDatum(TR_DATUM);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.setTextPadding(80);
+    char rpmStr[10];
+    sprintf(rpmStr, "%04d", aktualniRPM);
+    tft.drawString(rpmStr, 470, 235, 2);
+
+    int sirkaPruhuRPM = map(aktualniRPM, 0, 10000, 0, 458);
+    sirkaPruhuRPM = constrain(sirkaPruhuRPM, 0, 458);
+    
+    uint16_t barvaRPM = TFT_GREEN;
+    if (aktualniRPM > 7000) barvaRPM = TFT_YELLOW;
+    if (aktualniRPM > 8500) barvaRPM = TFT_RED;
+    
+    if (sirkaPruhuRPM != staraSirkaRPM || barvaRPM != staraBarvaRPM) {
+      if (barvaRPM != staraBarvaRPM || staraSirkaRPM == -1) {
+        tft.fillRect(11, 256, sirkaPruhuRPM, 13, barvaRPM);
+        tft.fillRect(11 + sirkaPruhuRPM, 256, 458 - sirkaPruhuRPM, 13, TFT_BLACK);
+      } else {
+        if (sirkaPruhuRPM > staraSirkaRPM) {
+          tft.fillRect(11 + staraSirkaRPM, 256, sirkaPruhuRPM - staraSirkaRPM, 13, barvaRPM);
+        } else {
+          tft.fillRect(11 + sirkaPruhuRPM, 256, staraSirkaRPM - sirkaPruhuRPM, 13, TFT_BLACK);
+        }
+      }
+      staraSirkaRPM = sirkaPruhuRPM;
+      staraBarvaRPM = barvaRPM;
+    }
+
+    // 4. PALIVOMĚR
+    tft.setTextDatum(TR_DATUM);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.setTextPadding(80);
+    char fuelStr[10];
+    sprintf(fuelStr, "%d%%", procentaPaliva);
+    tft.drawString(fuelStr, 470, 280, 2);
+
+    int sirkaPruhuFuel = map(procentaPaliva, 0, 100, 0, 458);
+    sirkaPruhuFuel = constrain(sirkaPruhuFuel, 0, 458);
+    
+    uint16_t barvaFuel = TFT_GREEN;
+    if (procentaPaliva < 25) barvaFuel = TFT_YELLOW;
+    if (procentaPaliva < 10) barvaFuel = TFT_RED;
+
+    if (sirkaPruhuFuel != staraSirkaFuel || barvaFuel != staraBarvaFuel) {
+      if (barvaFuel != staraBarvaFuel || staraSirkaFuel == -1) {
+        tft.fillRect(11, 301, sirkaPruhuFuel, 13, barvaFuel);
+        tft.fillRect(11 + sirkaPruhuFuel, 301, 458 - sirkaPruhuFuel, 13, TFT_BLACK);
+      } else {
+        if (sirkaPruhuFuel > staraSirkaFuel) {
+          tft.fillRect(11 + staraSirkaFuel, 301, sirkaPruhuFuel - staraSirkaFuel, 13, barvaFuel);
+        } else {
+          tft.fillRect(11 + sirkaPruhuFuel, 301, staraSirkaFuel - sirkaPruhuFuel, 13, TFT_BLACK);
+        }
+      }
+      staraSirkaFuel = sirkaPruhuFuel;
+      staraBarvaFuel = barvaFuel;
+    }
+
+    // Vynulování paddingu na konci
+    tft.setTextPadding(0);
   }
 }
